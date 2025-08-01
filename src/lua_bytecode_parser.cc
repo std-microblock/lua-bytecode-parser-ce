@@ -411,11 +411,6 @@ void LuaBytecodeWriter::write_block(const char *buffer, size_t size) {
 }
 
 void LuaBytecodeWriter::write_string(const std::string &s) {
-  if (s.empty()) {
-    write_byte(0);
-    return;
-  }
-
   size_t size = s.length() + 1;
   if (size < 0xFF) {
     write_byte(static_cast<std::uint8_t>(size));
