@@ -1,6 +1,9 @@
 #include "lua_bytecode_parser.h"
 #include <algorithm>
+#include <format>
+#include <print>
 #include <stdexcept>
+
 
 #define LUA_SIGNATURE_53 "\x1BLua"
 #define LUAC_VERSION_53_MAJOR 0x5
@@ -17,46 +20,11 @@ template <typename T> T bytes_to_value(const char *bytes) {
 }
 
 LuaBytecodeParser::LuaBytecodeParser(const std::vector<char> &bytecode_data)
-    : data_(bytecode_data), offset_(0) {}
+    : data_(bytecode_data), offset_(0), encrypt_key_(0),
+      is_ce_bytecode_(false) {}
 
 void LuaBytecodeParser::error(const std::string &msg) {
   throw std::runtime_error("Bytecode parsing error: " + msg);
-}
-
-std::uint8_t LuaBytecodeParser::read_byte() {
-  if (offset_ + sizeof(std::uint8_t) > data_.size()) {
-    error("truncated (byte)");
-  }
-  std::uint8_t value = bytes_to_value<std::uint8_t>(&data_[offset_]);
-  offset_ += sizeof(std::uint8_t);
-  return value;
-}
-
-std::uint32_t LuaBytecodeParser::read_int() {
-  if (offset_ + sizeof(std::uint32_t) > data_.size()) {
-    error("truncated (int)");
-  }
-  std::uint32_t value = bytes_to_value<std::uint32_t>(&data_[offset_]);
-  offset_ += sizeof(std::uint32_t);
-  return value;
-}
-
-lua_Number LuaBytecodeParser::read_number() {
-  if (offset_ + sizeof(lua_Number) > data_.size()) {
-    error("truncated (number)");
-  }
-  lua_Number value = bytes_to_value<lua_Number>(&data_[offset_]);
-  offset_ += sizeof(lua_Number);
-  return value;
-}
-
-lua_Integer LuaBytecodeParser::read_integer() {
-  if (offset_ + sizeof(lua_Integer) > data_.size()) {
-    error("truncated (integer)");
-  }
-  lua_Integer value = bytes_to_value<lua_Integer>(&data_[offset_]);
-  offset_ += sizeof(lua_Integer);
-  return value;
 }
 
 void LuaBytecodeParser::read_block(char *buffer, size_t size) {
@@ -64,13 +32,26 @@ void LuaBytecodeParser::read_block(char *buffer, size_t size) {
     error("truncated (block)");
   }
   std::copy(data_.begin() + offset_, data_.begin() + offset_ + size, buffer);
+
+  if (is_ce_bytecode_ && encrypt_key_ != 0) {
+    std::println("decrypting: key = {}, size = {}", encrypt_key_, size);
+    for (size_t i = 0; i < size; ++i) {
+      char decrypt_byte;
+      if ((((i + (i >> 3) & 7) & 7) - ((i >> 3) & 7)) != 0) {
+        decrypt_byte = (char)(encrypt_key_ >> (i % 0xe));
+      } else {
+        decrypt_byte = (char)0xce;
+      }
+      buffer[i] ^= decrypt_byte;
+    }
+  }
   offset_ += size;
 }
 
 std::string LuaBytecodeParser::read_string() {
   size_t size = read_byte();
   if (size == 0xFF) {
-    size = read_integer();
+    size = read_uint64();
   }
 
   if (size == 0) {
@@ -83,13 +64,22 @@ std::string LuaBytecodeParser::read_string() {
   }
 }
 
+static std::string hexdump(const std::string &s) {
+  std::string result;
+  for (unsigned char c : s) {
+    result += std::format("{:02x} ", c);
+  }
+  return result;
+}
+
 void LuaBytecodeParser::check_literal(const std::string &expected,
                                       const std::string &error_msg) {
   std::string buffer(expected.length(), '\0');
   read_block(&buffer[0], expected.length());
 
   if (buffer != expected) {
-    error(error_msg);
+    error(error_msg + std::format("expected '{}', got '{}'", hexdump(expected),
+                                  hexdump(buffer)));
   }
 }
 
@@ -114,34 +104,52 @@ void LuaBytecodeParser::check_header() {
     error("version mismatch");
   }
 
-  if (read_byte() != LUAC_FORMAT_53) {
-    error("format mismatch");
+  std::uint8_t format = read_byte();
+  if (format != LUAC_FORMAT_53) {
+    if (format == 1) {
+      encrypt_key_ = read_uint64();
+    } else {
+      error("format mismatch");
+    }
   }
 
   check_literal(LUAC_DATA_53, "corrupted data section");
 
   check_size(sizeof(int), "int");
-  check_size(sizeof(size_t), "size_t");
+  if (is_ce_bytecode_) {
+    check_size(8, "LUA_DUMP_STRINGSIZE_FORMAT2");
+  } else {
+    check_size(sizeof(size_t), "size_t");
+  }
   check_size(sizeof(Instruction), "Instruction");
   check_size(sizeof(lua_Integer), "lua_Integer");
   check_size(sizeof(lua_Number), "lua_Number");
 
-  if (read_integer() != LUAC_INT_53) {
+  if (read_uint64() != LUAC_INT_53) {
     error("endianness mismatch");
   }
-  if (read_number() != LUAC_NUM_53) {
+  if (read_double() != LUAC_NUM_53) {
     error("float format mismatch");
   }
+
+  if (format == 1)
+    is_ce_bytecode_ = true;
 }
 
 void LuaBytecodeParser::load_code(LuaProto &f) {
-  int n = read_int();
+  int n = read_uint32();
   f.code.resize(n);
   read_block(reinterpret_cast<char *>(f.code.data()), n * sizeof(Instruction));
+
+  if (is_ce_bytecode_ && encrypt_key_ != 0) {
+    for (int i = 0; i < n; ++i) {
+      f.code[i] -= (i & 3);
+    }
+  }
 }
 
 void LuaBytecodeParser::load_constants(LuaProto &f) {
-  std::uint32_t n = read_int();
+  std::uint32_t n = read_uint32();
   f.constants.resize(n);
   for (std::uint32_t i = 0; i < n; ++i) {
     LuaType t = static_cast<LuaType>(read_byte());
@@ -153,10 +161,10 @@ void LuaBytecodeParser::load_constants(LuaProto &f) {
       f.constants[i].bval = (read_byte() != 0);
       break;
     case LUA_TNUMFLT:
-      f.constants[i].nval = read_number();
+      f.constants[i].nval = read_double();
       break;
     case LUA_TNUMINT:
-      f.constants[i].ival = read_integer();
+      f.constants[i].ival = read_uint64();
       break;
     case LUA_TSHRSTR:
     case LUA_TLNGSTR:
@@ -169,7 +177,7 @@ void LuaBytecodeParser::load_constants(LuaProto &f) {
 }
 
 void LuaBytecodeParser::load_upvalues(LuaProto &f) {
-  int n = read_int();
+  int n = read_uint32();
   f.upvalues.resize(n);
   for (int i = 0; i < n; ++i) {
     f.upvalues[i].instack = read_byte();
@@ -178,7 +186,7 @@ void LuaBytecodeParser::load_upvalues(LuaProto &f) {
 }
 
 void LuaBytecodeParser::load_protos(LuaProto &f) {
-  int n = read_int();
+  int n = read_uint32();
   f.protos.resize(n);
   for (int i = 0; i < n; ++i) {
     f.protos[i] = std::make_shared<LuaProto>();
@@ -187,20 +195,20 @@ void LuaBytecodeParser::load_protos(LuaProto &f) {
 }
 
 void LuaBytecodeParser::load_debug(LuaProto &f) {
-  std::uint32_t n_lineinfo = read_int();
+  std::uint32_t n_lineinfo = read_uint32();
   f.lineinfo.resize(n_lineinfo);
   read_block(reinterpret_cast<char *>(f.lineinfo.data()),
              n_lineinfo * sizeof(std::uint32_t));
 
-  std::uint32_t n_locvars = read_int();
+  std::uint32_t n_locvars = read_uint32();
   f.locvars.resize(n_locvars);
   for (std::uint32_t i = 0; i < n_locvars; ++i) {
     f.locvars[i].varname = read_string();
-    f.locvars[i].startpc = read_int();
-    f.locvars[i].endpc = read_int();
+    f.locvars[i].startpc = read_uint32();
+    f.locvars[i].endpc = read_uint32();
   }
 
-  std::uint32_t n_upvalue_names = read_int();
+  std::uint32_t n_upvalue_names = read_uint32();
   f.upvalue_names.resize(n_upvalue_names);
   for (std::uint32_t i = 0; i < n_upvalue_names; ++i) {
     f.upvalue_names[i] = read_string();
@@ -212,8 +220,8 @@ void LuaBytecodeParser::load_function(LuaProto &f, const std::string &psource) {
   if (f.source.empty()) {
     f.source = psource;
   }
-  f.linedefined = read_int();
-  f.lastlinedefined = read_int();
+  f.linedefined = read_uint32();
+  f.lastlinedefined = read_uint32();
   f.numparams = read_byte();
   f.is_vararg = read_byte();
   f.maxstacksize = read_byte();
@@ -408,7 +416,7 @@ void LuaBytecodeWriter::write_string(const std::string &s) {
     write_byte(0);
     return;
   }
-  
+
   size_t size = s.length() + 1;
   if (size < 0xFF) {
     write_byte(static_cast<std::uint8_t>(size));

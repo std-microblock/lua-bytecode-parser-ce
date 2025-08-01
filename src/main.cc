@@ -4,6 +4,9 @@
 #include <iterator>
 #include "lua_bytecode_parser.h"
 
+#include "cpptrace/cpptrace.hpp"
+#include "cpptrace/from_current.hpp"
+
 int main(int argc, char* argv[]) {
     if (argc < 2 || argc > 3) {
         std::cerr << "Usage: " << argv[0] << " <input_lua_bytecode_file.luac> [output_lua_bytecode_file.luac]" << std::endl;
@@ -25,7 +28,7 @@ int main(int argc, char* argv[]) {
     );
     input_file.close();
 
-    try {
+    CPPTRACE_TRY {
         LuaBytecodeParser parser(bytecode_data);
         std::shared_ptr<LuaProto> main_proto = parser.parse();
 
@@ -34,7 +37,7 @@ int main(int argc, char* argv[]) {
             std::ofstream output_file(output_filename, std::ios::binary);
             if (!output_file.is_open()) {
                 std::cerr << "Error: Could not open output file " << output_filename << std::endl;
-                return 1;
+                throw std::runtime_error("Output file open error");
             }
             LuaBytecodeWriter writer(output_file);
             writer.write(*main_proto);
@@ -47,8 +50,9 @@ int main(int argc, char* argv[]) {
             std::cout << "Successfully parsed and formatted bytecode from " << input_filename << std::endl;
         }
 
-    } catch (const std::exception& e) {
+    } CPPTRACE_CATCH (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
+        cpptrace::from_current_exception().print();
         return 1;
     }
 
