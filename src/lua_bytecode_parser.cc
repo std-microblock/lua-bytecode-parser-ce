@@ -34,7 +34,6 @@ void LuaBytecodeParser::read_block(char *buffer, size_t size) {
   std::copy(data_.begin() + offset_, data_.begin() + offset_ + size, buffer);
 
   if (is_ce_bytecode_ && encrypt_key_ != 0) {
-    std::println("decrypting: key = {}, size = {}", encrypt_key_, size);
     for (size_t i = 0; i < size; ++i) {
       char decrypt_byte;
       if ((((i + (i >> 3) & 7) & 7) - ((i >> 3) & 7)) != 0) {
